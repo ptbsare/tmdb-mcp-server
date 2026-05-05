@@ -29,8 +29,8 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260422.1",
-    "@types/node": "^22.10.1",
-    "@types/node-fetch": "^2.6.12",
+    "@types/node": "^22.19.17",
+    "@types/node-fetch": "^2.6.13",
     "shx": "^0.3.4",
     "typescript": "^5.7.2",
     "wrangler": "^4.84.1"

@@ -1,0 +1,1107 @@
+#!/usr/bin/env node
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import fetch from 'node-fetch';
+import https from 'https';
+import dns from 'dns';
+import { constants as cryptoConstants } from 'crypto';
+// Apple Container VMs have no IPv6 routing — node-fetch hangs when it tries IPv6 first.
+// Force IPv4-first DNS. Also, TMDB's CloudFront rejects TLS 1.3 from OpenSSL 3.x Linux
+// environments. maxVersion alone is insufficient; SSL_OP_NO_TLSv1_3 must be set explicitly.
+dns.setDefaultResultOrder('ipv4first');
+const tmdbAgent = new https.Agent({
+    maxVersion: 'TLSv1.2',
+    secureOptions: cryptoConstants.SSL_OP_NO_TLSv1_3,
+});
+import { CallToolRequestSchema, ListResourcesRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
+import { createWeekendConcierge } from "./concierge.js";
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
+// TMDB_BASE_URL can be overridden to proxy through the host (avoids CloudFront routing issues
+// in Apple Container VMs where direct connections are unreliable).
+const TMDB_BASE_URL_OVERRIDE = process.env.TMDB_BASE_URL;
+const TMDB_BASE_URL = TMDB_BASE_URL_OVERRIDE || "https://api.themoviedb.org/3";
+const server = new Server({
+    name: "example-servers/tmdb",
+    version: "2.0.0",
+}, {
+    capabilities: {
+        resources: {},
+        tools: {},
+    },
+});
+async function fetchFromTMDB(endpoint, params = {}) {
+    const url = new URL(`${TMDB_BASE_URL}${endpoint}`);
+    url.searchParams.append("api_key", TMDB_API_KEY);
+    for (const [key, value] of Object.entries(params)) {
+        url.searchParams.append(key, value);
+    }
+    const safeUrl = `${TMDB_BASE_URL}${endpoint}`;
+    let lastError;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+            const response = await fetch(url.toString(), { agent: tmdbAgent });
+            if (!response.ok) {
+                if (attempt < 3 && (response.status === 429 || response.status >= 500)) {
+                    await new Promise((resolve) => setTimeout(resolve, attempt * 400));
+                    continue;
+                }
+                throw new Error(`TMDB API error for ${endpoint}: ${response.status} ${response.statusText}`);
+            }
+            return response.json();
+        }
+        catch (error) {
+            lastError = error;
+            if (attempt < 3) {
+                await new Promise((resolve) => setTimeout(resolve, attempt * 400));
+                continue;
+            }
+        }
+    }
+    const message = lastError instanceof Error
+        ? lastError.message.replace(url.toString(), safeUrl)
+        : String(lastError);
+    throw new Error(`TMDB API request failed for ${endpoint}: ${message}`);
+}
+async function getMovieDetails(movieId) {
+    return fetchFromTMDB(`/movie/${movieId}`, { append_to_response: "credits,reviews" });
+}
+function yearFrom(value) {
+    return value?.split("-")[0] || "unknown";
+}
+function providerNames(providers) {
+    return providers?.map((provider) => provider.provider_name).filter(Boolean) || [];
+}
+function compareBestFor(movie, countryProviders) {
+    const genres = movie.genres?.map((genre) => genre.name.toLowerCase()) || [];
+    const streaming = providerNames(countryProviders?.flatrate);
+    if (streaming.length > 0)
+        return "Best if you want something available on subscription streaming.";
+    if (movie.runtime && movie.runtime <= 105)
+        return "Best if you want the shortest, easiest watch.";
+    if (movie.vote_average >= 8)
+        return "Best if you want the strongest TMDB rating.";
+    if (genres.some((genre) => ["action", "adventure", "comedy", "family", "animation"].includes(genre))) {
+        return "Best for a lighter group watch.";
+    }
+    if (genres.some((genre) => ["drama", "history", "documentary"].includes(genre))) {
+        return "Best for a more focused, thoughtful watch.";
+    }
+    return "Best as a balanced pick across rating, runtime, and genre fit.";
+}
+function renderMovieComparison(movies, country) {
+    const lines = [
+        `Movie comparison (${country})`,
+        `Compared ${movies.length} movies by TMDB details and watch-provider availability.`,
+        "",
+    ];
+    movies.forEach(({ movie, providers }, index) => {
+        const director = movie.credits?.crew?.find((person) => person.job === "Director")?.name;
+        const cast = movie.credits?.cast?.slice(0, 4).map((person) => person.name).join(", ");
+        const streaming = providerNames(providers?.flatrate);
+        const rent = providerNames(providers?.rent);
+        const buy = providerNames(providers?.buy);
+        const availability = [
+            streaming.length > 0 ? `Streaming: ${streaming.join(", ")}` : null,
+            rent.length > 0 ? `Rent: ${rent.slice(0, 4).join(", ")}` : null,
+            buy.length > 0 ? `Buy: ${buy.slice(0, 4).join(", ")}` : null,
+        ].filter(Boolean).join("\n");
+        lines.push(`${index + 1}. ${movie.title} (${yearFrom(movie.release_date)}) - ID: ${movie.id}`, `Rating: ${movie.vote_average}/10`, movie.runtime ? `Runtime: ${movie.runtime} min` : "Runtime: unknown", movie.genres?.length ? `Genres: ${movie.genres.map((genre) => genre.name).join(", ")}` : "Genres: unknown", director ? `Director: ${director}` : "Director: unknown", cast ? `Cast: ${cast}` : "Cast: unknown", availability || `Availability: no providers found for ${country}`, `Best for: ${compareBestFor(movie, providers)}`, `Overview: ${movie.overview}`, "", "---", "");
+    });
+    const sortedByRating = [...movies].sort((a, b) => b.movie.vote_average - a.movie.vote_average);
+    const streamingPicks = movies.filter(({ providers }) => providerNames(providers?.flatrate).length > 0);
+    const shortest = [...movies]
+        .filter(({ movie }) => movie.runtime)
+        .sort((a, b) => (a.movie.runtime || 0) - (b.movie.runtime || 0))[0];
+    lines.push("Quick decision");
+    lines.push(`- Highest rated: ${sortedByRating[0].movie.title} (${sortedByRating[0].movie.vote_average}/10)`);
+    if (shortest)
+        lines.push(`- Shortest runtime: ${shortest.movie.title} (${shortest.movie.runtime} min)`);
+    if (streamingPicks.length > 0) {
+        lines.push(`- Streaming in ${country}: ${streamingPicks.map(({ movie }) => movie.title).join(", ")}`);
+    }
+    else {
+        lines.push(`- Streaming in ${country}: none found in TMDB provider data`);
+    }
+    return lines.join("\n");
+}
+function serviceMatches(available, requested) {
+    if (requested.length === 0)
+        return [];
+    const normalizedRequested = requested.map((service) => service.toLowerCase());
+    return available.filter((provider) => normalizedRequested.some((service) => provider.toLowerCase().includes(service)));
+}
+function renderProviderBlock(providers) {
+    const streaming = providerNames(providers?.flatrate);
+    const rent = providerNames(providers?.rent);
+    const buy = providerNames(providers?.buy);
+    const lines = [
+        streaming.length > 0 ? `Streaming: ${streaming.join(", ")}` : null,
+        rent.length > 0 ? `Rent: ${rent.slice(0, 5).join(", ")}` : null,
+        buy.length > 0 ? `Buy: ${buy.slice(0, 5).join(", ")}` : null,
+        providers?.link ? `TMDB watch link: ${providers.link}` : null,
+    ].filter((line) => Boolean(line));
+    return {
+        lines,
+        allProviderNames: [...streaming, ...rent, ...buy],
+    };
+}
+function renderWhereToWatch(matches, country, requestedServices) {
+    const lines = [
+        `Where to watch (${country})`,
+        requestedServices.length > 0
+            ? `Preferred services: ${requestedServices.join(", ")}`
+            : "Preferred services: any",
+        "",
+    ];
+    const serviceMatchedTitles = [];
+    matches.forEach(({ query, movie, providers }, index) => {
+        lines.push(`${index + 1}. ${query}`);
+        if (!movie) {
+            lines.push("No TMDB movie match found.", "");
+            return;
+        }
+        const providerBlock = renderProviderBlock(providers);
+        const matchedServices = serviceMatches(providerBlock.allProviderNames, requestedServices);
+        if (matchedServices.length > 0)
+            serviceMatchedTitles.push(`${movie.title} via ${matchedServices.join(", ")}`);
+        lines.push(`Matched: ${movie.title} (${yearFrom(movie.release_date)}) - ID: ${movie.id}`, `Rating: ${movie.vote_average}/10`, providerBlock.lines.length > 0
+            ? providerBlock.lines.join("\n")
+            : `No watch providers found for ${country}.`);
+        if (requestedServices.length > 0) {
+            lines.push(matchedServices.length > 0
+                ? `Preferred service match: ${matchedServices.join(", ")}`
+                : "Preferred service match: none found");
+        }
+        lines.push("");
+    });
+    lines.push("Quick decision");
+    if (serviceMatchedTitles.length > 0) {
+        lines.push(`- Preferred-service matches: ${serviceMatchedTitles.join("; ")}`);
+    }
+    else if (requestedServices.length > 0) {
+        lines.push("- Preferred-service matches: none found in TMDB provider data");
+    }
+    const anyAvailability = matches
+        .filter(({ providers }) => renderProviderBlock(providers).allProviderNames.length > 0)
+        .map(({ movie }) => movie?.title)
+        .filter(Boolean);
+    lines.push(anyAvailability.length > 0
+        ? `- Any availability found: ${anyAvailability.join(", ")}`
+        : `- Any availability found: none for ${country}`);
+    return lines.join("\n");
+}
+function conciergeSummary(result) {
+    const picks = result.picks
+        .map((pick, index) => {
+        const providers = pick.providers.streaming.length > 0
+            ? `Streaming: ${pick.providers.streaming.join(", ")}`
+            : "Streaming: no subscription provider found";
+        const facts = [
+            `${pick.year}`,
+            `${pick.rating.toFixed(1)}/10`,
+            pick.runtime ? `${pick.runtime} min` : null,
+            pick.genres.length > 0 ? pick.genres.slice(0, 3).join(", ") : null,
+        ].filter(Boolean).join(" | ");
+        return `${index + 1}. ${pick.title} - ID: ${pick.id}\n` +
+            `${facts}\n` +
+            `${providers}\n` +
+            `Why: ${pick.reasons.join("; ")}\n` +
+            `Overview: ${pick.overview}`;
+    })
+        .join("\n---\n");
+    const notes = result.notes.length > 0 ? `\n\nNotes:\n${result.notes.map((note) => `- ${note}`).join("\n")}` : "";
+    return `Weekend Watch Concierge picks\n` +
+        `Mood: ${result.mood}\n` +
+        `Country: ${result.country}\n` +
+        `Language: ${result.language}\n\n` +
+        `${picks || "No matching picks found."}` +
+        notes;
+}
+const WEEKLY_TRENDING_LANGUAGES = [
+    { label: "English", code: "en" },
+    { label: "Hindi", code: "hi" },
+    { label: "Telugu", code: "te" },
+];
+function renderWeeklyTrendingByLanguage(movies) {
+    const lines = [
+        "Weekly trending movies by original language",
+        "Source: TMDB /trending/movie/week, first results page",
+    ];
+    for (const language of WEEKLY_TRENDING_LANGUAGES) {
+        const matches = movies.filter((movie) => movie.original_language === language.code);
+        lines.push("", `${language.label} (${language.code})`);
+        if (matches.length === 0) {
+            lines.push("- No movies in the current weekly trending top results.");
+            continue;
+        }
+        matches.forEach((movie, index) => {
+            const year = movie.release_date?.split("-")[0] || "unknown";
+            lines.push(`${index + 1}. ${movie.title} (${year}) - ID: ${movie.id} - Rating: ${movie.vote_average}/10`);
+        });
+    }
+    return lines.join("\n");
+}
+server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+    const params = {
+        page: request.params?.cursor || "1",
+    };
+    const data = await fetchFromTMDB("/movie/popular", params);
+    return {
+        resources: data.results.map((movie) => ({
+            uri: `tmdb:///movie/${movie.id}`,
+            mimeType: "application/json",
+            name: `${movie.title} (${movie.release_date.split("-")[0]})`,
+        })),
+        nextCursor: data.page < data.total_pages ? String(data.page + 1) : undefined,
+    };
+});
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const movieId = request.params.uri.replace("tmdb:///movie/", "");
+    const movie = await getMovieDetails(movieId);
+    const movieInfo = {
+        title: movie.title,
+        releaseDate: movie.release_date,
+        rating: movie.vote_average,
+        overview: movie.overview,
+        genres: movie.genres?.map(g => g.name).join(", "),
+        runtime: movie.runtime ? `${movie.runtime} min` : undefined,
+        posterUrl: movie.poster_path ?
+            `https://image.tmdb.org/t/p/w500${movie.poster_path}` :
+            "No poster available",
+        cast: movie.credits?.cast?.slice(0, 5).map(actor => `${actor.name} as ${actor.character}`),
+        director: movie.credits?.crew?.find(person => person.job === "Director")?.name,
+        reviews: movie.reviews?.results?.slice(0, 3).map(review => ({
+            author: review.author,
+            content: review.content,
+            rating: review.rating
+        }))
+    };
+    return {
+        contents: [
+            {
+                uri: request.params.uri,
+                mimeType: "application/json",
+                text: JSON.stringify(movieInfo, null, 2),
+            },
+        ],
+    };
+});
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return {
+        tools: [
+            {
+                name: "get_weekend_watchlist",
+                description: "Generate a ranked movie shortlist for a weekend watch session using mood, country, language, runtime, rating, and streaming services",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        mood: {
+                            type: "string",
+                            enum: ["crowd", "thriller", "thoughtful", "funny", "family", "mindbend"],
+                            description: "Viewing mood. Defaults to crowd.",
+                        },
+                        country: {
+                            type: "string",
+                            description: "ISO 3166-1 country code for watch providers. Defaults to IN.",
+                        },
+                        language: {
+                            type: "string",
+                            description: "Original language code such as en, hi, ta, te, ko, or any.",
+                        },
+                        runtime: {
+                            type: "string",
+                            description: "Maximum runtime in minutes, or any.",
+                        },
+                        minRating: {
+                            type: "string",
+                            description: "Minimum TMDB rating from 0 to 9. Defaults to 6.5.",
+                        },
+                        services: {
+                            type: "array",
+                            items: { type: "string" },
+                            description: "Preferred streaming services, for example Netflix or Prime Video.",
+                        },
+                    },
+                },
+            },
+            {
+                name: "search_movies",
+                description: "Search for movies by title or keywords",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        query: {
+                            type: "string",
+                            description: "Search query for movie titles",
+                        },
+                    },
+                    required: ["query"],
+                },
+            },
+            {
+                name: "get_recommendations",
+                description: "Get movie recommendations based on a movie ID",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        movieId: {
+                            type: "string",
+                            description: "TMDB movie ID to get recommendations for",
+                        },
+                    },
+                    required: ["movieId"],
+                },
+            },
+            {
+                name: "get_trending",
+                description: "Get trending movies for a time window",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        timeWindow: {
+                            type: "string",
+                            enum: ["day", "week"],
+                            description: "Time window for trending movies",
+                        },
+                    },
+                    required: ["timeWindow"],
+                },
+            },
+            {
+                name: "get_weekly_trending_by_language",
+                description: "Get weekly trending movies grouped into English, Hindi, and Telugu by TMDB original_language",
+                inputSchema: {
+                    type: "object",
+                    properties: {},
+                },
+            },
+            {
+                name: "search_by_genre",
+                description: "Search for movies by genre",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        genre: {
+                            type: "string",
+                            description: "Genre name (e.g., 'action', 'comedy', 'horror')",
+                        },
+                        year: {
+                            type: "string",
+                            description: "Optional year filter",
+                        },
+                    },
+                    required: ["genre"],
+                },
+            },
+            {
+                name: "advanced_search",
+                description: "Advanced movie search with multiple filters",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        genre: {
+                            type: "string",
+                            description: "Genre name (optional)",
+                        },
+                        year: {
+                            type: "string",
+                            description: "Release year (optional)",
+                        },
+                        minRating: {
+                            type: "string",
+                            description: "Minimum rating (0-10, optional)",
+                        },
+                        sortBy: {
+                            type: "string",
+                            enum: ["popularity.desc", "popularity.asc", "vote_average.desc", "vote_average.asc", "release_date.desc", "release_date.asc"],
+                            description: "Sort order (optional, defaults to popularity.desc)",
+                        },
+                        language: {
+                            type: "string",
+                            description: "Language code (e.g., 'en', 'es', 'fr', optional)",
+                        },
+                    },
+                },
+            },
+            {
+                name: "search_person",
+                description: "Search for actors, directors, or other people in the film industry",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        name: {
+                            type: "string",
+                            description: "Person's name to search for",
+                        },
+                    },
+                    required: ["name"],
+                },
+            },
+            {
+                name: "search_by_keyword",
+                description: "Search for movies by keywords or themes",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        keyword: {
+                            type: "string",
+                            description: "Keyword or theme to search for (e.g., 'artificial intelligence', 'space', 'zombie')",
+                        },
+                    },
+                    required: ["keyword"],
+                },
+            },
+            {
+                name: "get_movie_details",
+                description: "Get full details for a movie including cast, crew, runtime, budget, and reviews",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        movieId: {
+                            type: "string",
+                            description: "TMDB movie ID",
+                        },
+                    },
+                    required: ["movieId"],
+                },
+            },
+            {
+                name: "compare_movies",
+                description: "Compare 2 to 5 movies side by side with ratings, runtime, genres, cast, director, watch providers, and best-fit notes",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        movieIds: {
+                            type: "array",
+                            items: { type: "string" },
+                            minItems: 2,
+                            maxItems: 5,
+                            description: "TMDB movie IDs to compare",
+                        },
+                        country: {
+                            type: "string",
+                            description: "ISO 3166-1 country code for watch-provider availability. Defaults to IN.",
+                        },
+                    },
+                    required: ["movieIds"],
+                },
+            },
+            {
+                name: "get_watch_providers",
+                description: "Get streaming, rental, and purchase availability for a movie by country",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        movieId: {
+                            type: "string",
+                            description: "TMDB movie ID",
+                        },
+                        country: {
+                            type: "string",
+                            description: "ISO 3166-1 country code (e.g., 'US', 'IN', 'GB'). Defaults to 'IN'.",
+                        },
+                    },
+                    required: ["movieId"],
+                },
+            },
+            {
+                name: "find_where_to_watch",
+                description: "Find where one or more movie titles are available by searching titles, matching TMDB movies, and checking streaming, rental, and purchase providers",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        titles: {
+                            type: "array",
+                            items: { type: "string" },
+                            minItems: 1,
+                            maxItems: 5,
+                            description: "Movie titles to search and check for availability",
+                        },
+                        country: {
+                            type: "string",
+                            description: "ISO 3166-1 country code for provider availability. Defaults to IN.",
+                        },
+                        services: {
+                            type: "array",
+                            items: { type: "string" },
+                            description: "Optional preferred services to highlight, for example Netflix, Prime Video, or Disney Plus.",
+                        },
+                    },
+                    required: ["titles"],
+                },
+            },
+            {
+                name: "search_tv_shows",
+                description: "Search for TV shows and series by title",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        query: {
+                            type: "string",
+                            description: "Search query for TV show titles",
+                        },
+                    },
+                    required: ["query"],
+                },
+            },
+            {
+                name: "get_trending_tv",
+                description: "Get trending TV shows for a time window",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        timeWindow: {
+                            type: "string",
+                            enum: ["day", "week"],
+                            description: "Time window for trending TV shows",
+                        },
+                    },
+                    required: ["timeWindow"],
+                },
+            },
+            {
+                name: "get_person_details",
+                description: "Get full biography and filmography for an actor or director",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        personId: {
+                            type: "string",
+                            description: "TMDB person ID (from search_person results)",
+                        },
+                    },
+                    required: ["personId"],
+                },
+            },
+            {
+                name: "get_similar_movies",
+                description: "Get movies similar to a given movie (uses TMDB similarity algorithm, different from recommendations)",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        movieId: {
+                            type: "string",
+                            description: "TMDB movie ID",
+                        },
+                    },
+                    required: ["movieId"],
+                },
+            },
+            {
+                name: "get_now_playing",
+                description: "Get movies currently playing in theaters. Returns titles, ratings, release dates, and overviews for movies now in cinemas.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        region: {
+                            type: "string",
+                            description: "ISO 3166-1 country code to filter theatrical releases (e.g. IN, US, GB). Defaults to IN.",
+                        },
+                        page: {
+                            type: "number",
+                            description: "Page number for pagination (default: 1)",
+                        },
+                    },
+                    required: [],
+                },
+            },
+        ],
+    };
+});
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    try {
+        switch (request.params.name) {
+            case "get_weekend_watchlist": {
+                const result = await createWeekendConcierge({
+                    TMDB_API_KEY,
+                    TMDB_BASE_URL,
+                }, {
+                    mood: request.params.arguments?.mood,
+                    country: request.params.arguments?.country,
+                    language: request.params.arguments?.language,
+                    runtime: request.params.arguments?.runtime,
+                    minRating: request.params.arguments?.minRating,
+                    services: request.params.arguments?.services,
+                });
+                return {
+                    content: [{ type: "text", text: conciergeSummary(result) }],
+                    isError: false,
+                };
+            }
+            case "search_movies": {
+                const query = request.params.arguments?.query;
+                const data = await fetchFromTMDB("/search/movie", { query });
+                const results = data.results
+                    .map((movie) => `${movie.title} (${movie.release_date?.split("-")[0]}) - ID: ${movie.id}\n` +
+                    `Rating: ${movie.vote_average}/10\n` +
+                    `Overview: ${movie.overview}\n`)
+                    .join("\n---\n");
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Found ${data.results.length} movies:\n\n${results}`,
+                        },
+                    ],
+                    isError: false,
+                };
+            }
+            case "get_recommendations": {
+                const movieId = request.params.arguments?.movieId;
+                const data = await fetchFromTMDB(`/movie/${movieId}/recommendations`);
+                const recommendations = data.results
+                    .slice(0, 5)
+                    .map((movie) => `${movie.title} (${movie.release_date?.split("-")[0]})\n` +
+                    `Rating: ${movie.vote_average}/10\n` +
+                    `Overview: ${movie.overview}\n`)
+                    .join("\n---\n");
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Top 5 recommendations:\n\n${recommendations}`,
+                        },
+                    ],
+                    isError: false,
+                };
+            }
+            case "get_trending": {
+                const timeWindow = request.params.arguments?.timeWindow;
+                const data = await fetchFromTMDB(`/trending/movie/${timeWindow}`);
+                const trending = data.results
+                    .slice(0, 10)
+                    .map((movie) => `${movie.title} (${movie.release_date?.split("-")[0]})\n` +
+                    `Rating: ${movie.vote_average}/10\n` +
+                    `Overview: ${movie.overview}\n`)
+                    .join("\n---\n");
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Trending movies for the ${timeWindow}:\n\n${trending}`,
+                        },
+                    ],
+                    isError: false,
+                };
+            }
+            case "get_weekly_trending_by_language": {
+                const data = await fetchFromTMDB("/trending/movie/week");
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: renderWeeklyTrendingByLanguage(data.results),
+                        },
+                    ],
+                    isError: false,
+                };
+            }
+            case "search_by_genre": {
+                const genre = request.params.arguments?.genre;
+                const year = request.params.arguments?.year;
+                const genresData = await fetchFromTMDB("/genre/movie/list");
+                const genreObj = genresData.genres.find(g => g.name.toLowerCase() === genre.toLowerCase());
+                if (!genreObj) {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Genre "${genre}" not found. Available genres: ${genresData.genres.map(g => g.name).join(", ")}`,
+                            },
+                        ],
+                        isError: true,
+                    };
+                }
+                const params = {
+                    with_genres: genreObj.id.toString(),
+                    sort_by: "popularity.desc"
+                };
+                if (year) {
+                    params.year = year;
+                }
+                const data = await fetchFromTMDB("/discover/movie", params);
+                const results = data.results
+                    .slice(0, 10)
+                    .map((movie) => `${movie.title} (${movie.release_date?.split("-")[0]}) - ID: ${movie.id}\n` +
+                    `Rating: ${movie.vote_average}/10\n` +
+                    `Overview: ${movie.overview}\n`)
+                    .join("\n---\n");
+                const yearFilter = year ? ` from ${year}` : "";
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Found ${Math.min(data.results.length, 10)} ${genre} movies${yearFilter}:\n\n${results}`,
+                        },
+                    ],
+                    isError: false,
+                };
+            }
+            case "advanced_search": {
+                const genre = request.params.arguments?.genre;
+                const year = request.params.arguments?.year;
+                const minRating = request.params.arguments?.minRating;
+                const sortBy = request.params.arguments?.sortBy || "popularity.desc";
+                const language = request.params.arguments?.language;
+                const params = {
+                    sort_by: sortBy
+                };
+                if (genre) {
+                    const genresData = await fetchFromTMDB("/genre/movie/list");
+                    const genreObj = genresData.genres.find(g => g.name.toLowerCase() === genre.toLowerCase());
+                    if (!genreObj) {
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Genre "${genre}" not found. Available genres: ${genresData.genres.map(g => g.name).join(", ")}`,
+                                },
+                            ],
+                            isError: true,
+                        };
+                    }
+                    params.with_genres = genreObj.id.toString();
+                }
+                if (year)
+                    params.year = year;
+                if (minRating)
+                    params["vote_average.gte"] = minRating;
+                if (language)
+                    params.with_original_language = language;
+                const data = await fetchFromTMDB("/discover/movie", params);
+                const results = data.results
+                    .slice(0, 10)
+                    .map((movie) => `${movie.title} (${movie.release_date?.split("-")[0]}) - ID: ${movie.id}\n` +
+                    `Rating: ${movie.vote_average}/10\n` +
+                    `Overview: ${movie.overview}\n`)
+                    .join("\n---\n");
+                const filters = [];
+                if (genre)
+                    filters.push(`Genre: ${genre}`);
+                if (year)
+                    filters.push(`Year: ${year}`);
+                if (minRating)
+                    filters.push(`Min Rating: ${minRating}/10`);
+                if (language)
+                    filters.push(`Language: ${language}`);
+                const filterText = filters.length > 0 ? ` (${filters.join(", ")})` : "";
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Found ${Math.min(data.results.length, 10)} movies${filterText}:\n\n${results}`,
+                        },
+                    ],
+                    isError: false,
+                };
+            }
+            case "search_person": {
+                const name = request.params.arguments?.name;
+                const data = await fetchFromTMDB("/search/person", { query: name });
+                const results = data.results
+                    .slice(0, 5)
+                    .map((person) => {
+                    const knownFor = person.known_for
+                        .slice(0, 3)
+                        .map(movie => `${movie.title} (${movie.release_date?.split("-")[0]})`)
+                        .join(", ");
+                    return `${person.name} - ID: ${person.id}\n` +
+                        `Department: ${person.known_for_department}\n` +
+                        `Known for: ${knownFor}\n` +
+                        `Popularity: ${person.popularity.toFixed(1)}`;
+                })
+                    .join("\n---\n");
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Found ${Math.min(data.results.length, 5)} people matching "${name}":\n\n${results}`,
+                        },
+                    ],
+                    isError: false,
+                };
+            }
+            case "search_by_keyword": {
+                const keyword = request.params.arguments?.keyword;
+                const keywordData = await fetchFromTMDB("/search/keyword", { query: keyword });
+                if (keywordData.results.length === 0) {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `No keywords found matching "${keyword}". Try using more general terms or different keywords.`,
+                            },
+                        ],
+                        isError: false,
+                    };
+                }
+                const keywordId = keywordData.results[0].id;
+                const keywordName = keywordData.results[0].name;
+                const movieData = await fetchFromTMDB("/discover/movie", {
+                    with_keywords: keywordId.toString(),
+                    sort_by: "popularity.desc"
+                });
+                const results = movieData.results
+                    .slice(0, 10)
+                    .map((movie) => `${movie.title} (${movie.release_date?.split("-")[0]}) - ID: ${movie.id}\n` +
+                    `Rating: ${movie.vote_average}/10\n` +
+                    `Overview: ${movie.overview}\n`)
+                    .join("\n---\n");
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Found ${Math.min(movieData.results.length, 10)} movies with keyword "${keywordName}":\n\n${results}`,
+                        },
+                    ],
+                    isError: false,
+                };
+            }
+            case "get_movie_details": {
+                const movieId = request.params.arguments?.movieId;
+                const movie = await getMovieDetails(movieId);
+                const director = movie.credits?.crew?.find(p => p.job === "Director")?.name;
+                const writers = movie.credits?.crew
+                    ?.filter(p => p.job === "Screenplay" || p.job === "Writer" || p.job === "Story")
+                    .slice(0, 3)
+                    .map(p => p.name)
+                    .join(", ");
+                const cast = movie.credits?.cast?.slice(0, 8).map(a => `${a.name} as ${a.character}`).join("\n  ");
+                const topReview = movie.reviews?.results?.[0];
+                const lines = [
+                    `**${movie.title}** (${movie.release_date?.split("-")[0]})`,
+                    `ID: ${movie.id}`,
+                    `Rating: ${movie.vote_average}/10`,
+                    movie.runtime ? `Runtime: ${movie.runtime} min` : null,
+                    movie.genres?.length ? `Genres: ${movie.genres.map(g => g.name).join(", ")}` : null,
+                    `\nOverview: ${movie.overview}`,
+                    director ? `\nDirector: ${director}` : null,
+                    writers ? `Writers: ${writers}` : null,
+                    cast ? `\nCast:\n  ${cast}` : null,
+                    topReview ? `\nTop Review by ${topReview.author}:\n"${topReview.content.slice(0, 300)}..."` : null,
+                ].filter(Boolean).join("\n");
+                return {
+                    content: [{ type: "text", text: lines }],
+                    isError: false,
+                };
+            }
+            case "compare_movies": {
+                const movieIds = request.params.arguments?.movieIds;
+                const country = (request.params.arguments?.country || "IN").toUpperCase();
+                if (!Array.isArray(movieIds) || movieIds.length < 2 || movieIds.length > 5) {
+                    return {
+                        content: [{ type: "text", text: "compare_movies requires 2 to 5 TMDB movie IDs." }],
+                        isError: true,
+                    };
+                }
+                const comparisons = await Promise.all(movieIds.map(async (movieId) => {
+                    const [movie, providersResult] = await Promise.all([
+                        getMovieDetails(movieId),
+                        fetchFromTMDB(`/movie/${movieId}/watch/providers`).catch(() => undefined),
+                    ]);
+                    return {
+                        movie,
+                        providers: providersResult?.results?.[country],
+                    };
+                }));
+                return {
+                    content: [{ type: "text", text: renderMovieComparison(comparisons, country) }],
+                    isError: false,
+                };
+            }
+            case "get_watch_providers": {
+                const movieId = request.params.arguments?.movieId;
+                const country = request.params.arguments?.country || "IN";
+                const data = await fetchFromTMDB(`/movie/${movieId}/watch/providers`);
+                const countryData = data.results[country];
+                if (!countryData) {
+                    const availableCountries = Object.keys(data.results).slice(0, 10).join(", ");
+                    return {
+                        content: [{
+                                type: "text",
+                                text: `No watch providers found for ${country}. Available countries include: ${availableCountries}`,
+                            }],
+                        isError: false,
+                    };
+                }
+                const lines = [`Watch providers for this movie in ${country}:`];
+                if (countryData.flatrate?.length) {
+                    lines.push(`\nStreaming (subscription):`);
+                    countryData.flatrate.forEach(p => lines.push(`  • ${p.provider_name}`));
+                }
+                if (countryData.rent?.length) {
+                    lines.push(`\nAvailable to rent:`);
+                    countryData.rent.forEach(p => lines.push(`  • ${p.provider_name}`));
+                }
+                if (countryData.buy?.length) {
+                    lines.push(`\nAvailable to buy:`);
+                    countryData.buy.forEach(p => lines.push(`  • ${p.provider_name}`));
+                }
+                if (countryData.link) {
+                    lines.push(`\nFull details: ${countryData.link}`);
+                }
+                return {
+                    content: [{ type: "text", text: lines.join("\n") }],
+                    isError: false,
+                };
+            }
+            case "find_where_to_watch": {
+                const titles = request.params.arguments?.titles;
+                const country = (request.params.arguments?.country || "IN").toUpperCase();
+                const services = (request.params.arguments?.services || [])
+                    .map((service) => service.trim())
+                    .filter(Boolean);
+                if (!Array.isArray(titles) || titles.length < 1 || titles.length > 5) {
+                    return {
+                        content: [{ type: "text", text: "find_where_to_watch requires 1 to 5 movie titles." }],
+                        isError: true,
+                    };
+                }
+                const matches = await Promise.all(titles.map(async (query) => {
+                    const search = await fetchFromTMDB("/search/movie", { query });
+                    const movie = search.results[0];
+                    if (!movie)
+                        return { query };
+                    const providersResult = await fetchFromTMDB(`/movie/${movie.id}/watch/providers`).catch(() => undefined);
+                    return {
+                        query,
+                        movie,
+                        providers: providersResult?.results?.[country],
+                    };
+                }));
+                return {
+                    content: [{ type: "text", text: renderWhereToWatch(matches, country, services) }],
+                    isError: false,
+                };
+            }
+            case "search_tv_shows": {
+                const query = request.params.arguments?.query;
+                const data = await fetchFromTMDB("/search/tv", { query });
+                const results = data.results
+                    .slice(0, 10)
+                    .map((show) => `${show.name} (${show.first_air_date?.split("-")[0]}) - ID: ${show.id}\n` +
+                    `Rating: ${show.vote_average}/10\n` +
+                    `Overview: ${show.overview}\n`)
+                    .join("\n---\n");
+                return {
+                    content: [{
+                            type: "text",
+                            text: `Found ${Math.min(data.results.length, 10)} TV shows matching "${query}":\n\n${results}`,
+                        }],
+                    isError: false,
+                };
+            }
+            case "get_trending_tv": {
+                const timeWindow = request.params.arguments?.timeWindow;
+                const data = await fetchFromTMDB(`/trending/tv/${timeWindow}`);
+                const trending = data.results
+                    .slice(0, 10)
+                    .map((show) => `${show.name} (${show.first_air_date?.split("-")[0]})\n` +
+                    `Rating: ${show.vote_average}/10\n` +
+                    `Overview: ${show.overview}\n`)
+                    .join("\n---\n");
+                return {
+                    content: [{
+                            type: "text",
+                            text: `Trending TV shows for the ${timeWindow}:\n\n${trending}`,
+                        }],
+                    isError: false,
+                };
+            }
+            case "get_person_details": {
+                const personId = request.params.arguments?.personId;
+                const person = await fetchFromTMDB(`/person/${personId}`, { append_to_response: "movie_credits,tv_credits" });
+                const topMovies = person.movie_credits?.cast
+                    ?.sort((a, b) => (b.vote_average || 0) - (a.vote_average || 0))
+                    .slice(0, 10)
+                    .map(m => `  • ${m.title} (${m.release_date?.split("-")[0]}) as ${m.character} — ${m.vote_average?.toFixed(1)}/10`)
+                    .join("\n");
+                const directedMovies = person.movie_credits?.crew
+                    ?.filter(m => m.job === "Director")
+                    .sort((a, b) => b.release_date?.localeCompare(a.release_date || "") || 0)
+                    .slice(0, 5)
+                    .map(m => `  • ${m.title} (${m.release_date?.split("-")[0]})`)
+                    .join("\n");
+                const topTV = person.tv_credits?.cast
+                    ?.slice(0, 5)
+                    .map(s => `  • ${s.name} (${s.first_air_date?.split("-")[0]}) as ${s.character}`)
+                    .join("\n");
+                const lines = [
+                    `**${person.name}**`,
+                    `ID: ${person.id}`,
+                    `Department: ${person.known_for_department}`,
+                    person.birthday ? `Born: ${person.birthday}${person.place_of_birth ? ` in ${person.place_of_birth}` : ""}` : null,
+                    person.biography ? `\nBiography: ${person.biography.slice(0, 500)}${person.biography.length > 500 ? "..." : ""}` : null,
+                    topMovies ? `\nTop Movies (by rating):\n${topMovies}` : null,
+                    directedMovies ? `\nDirected:\n${directedMovies}` : null,
+                    topTV ? `\nTV Shows:\n${topTV}` : null,
+                ].filter(Boolean).join("\n");
+                return {
+                    content: [{ type: "text", text: lines }],
+                    isError: false,
+                };
+            }
+            case "get_similar_movies": {
+                const movieId = request.params.arguments?.movieId;
+                const data = await fetchFromTMDB(`/movie/${movieId}/similar`);
+                const similar = data.results
+                    .slice(0, 10)
+                    .map((movie) => `${movie.title} (${movie.release_date?.split("-")[0]}) - ID: ${movie.id}\n` +
+                    `Rating: ${movie.vote_average}/10\n` +
+                    `Overview: ${movie.overview}\n`)
+                    .join("\n---\n");
+                return {
+                    content: [{
+                            type: "text",
+                            text: `Similar movies:\n\n${similar}`,
+                        }],
+                    isError: false,
+                };
+            }
+            case "get_now_playing": {
+                const region = request.params.arguments?.region || "IN";
+                const page = request.params.arguments?.page || 1;
+                const data = await fetchFromTMDB("/movie/now_playing", { region, page: String(page) });
+                const movies = data.results
+                    .slice(0, 15)
+                    .map((movie) => `${movie.title} (${movie.release_date?.split("-")[0]}) - ID: ${movie.id}\n` +
+                    `Rating: ${movie.vote_average}/10\n` +
+                    `Overview: ${movie.overview}\n`)
+                    .join("\n---\n");
+                const dateRange = data.dates
+                    ? ` (from ${data.dates.minimum} to ${data.dates.maximum})`
+                    : "";
+                return {
+                    content: [{
+                            type: "text",
+                            text: `Movies now playing in theaters${dateRange}:\n\n${movies}`,
+                        }],
+                    isError: false,
+                };
+            }
+            default:
+                throw new Error("Tool not found");
+        }
+    }
+    catch (error) {
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `Error: ${error instanceof Error ? error.message : 'Unknown error occurred'}`,
+                },
+            ],
+            isError: true,
+        };
+    }
+});
+// Start the server
+if (!TMDB_API_KEY) {
+    console.error("TMDB_API_KEY environment variable is required");
+    process.exit(1);
+}
+const transport = new StdioServerTransport();
+server.connect(transport).catch((error) => {
+    console.error("Server connection error:", error);
+    process.exit(1);
+});
