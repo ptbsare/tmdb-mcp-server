@@ -34,12 +34,24 @@ An MCP server for The Movie Database (TMDB) API. It provides movie and TV search
 
 ## Quick Start
 
+### One-liner with npx (no install)
+
+You can run the server directly from the Git URL without cloning:
+
+```bash
+TMDB_API_KEY=your_key_here npx "git+https://github.com/ptbsare/tmdb-mcp-server.git" mcp-server-tmdb
+```
+
+Use this command in any MCP client config that accepts a local stdio server.
+
+### Local install
+
 1. Get a TMDB API key at [themoviedb.org](https://www.themoviedb.org/) → Account Settings → API
 
 2. Clone, install, and build:
    ```bash
-   git clone https://github.com/Laksh-star/mcp-server-tmdb.git
-   cd mcp-server-tmdb
+   git clone https://github.com/ptbsare/tmdb-mcp-server.git
+   cd tmdb-mcp-server
    npm install
    ```
 
@@ -323,7 +335,33 @@ The launcher reads `TMDB_API_KEY` from your shell environment or from the repo `
 
 ## Usage with Claude Desktop
 
-If you prefer manual setup, add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+### Option A: npx one-liner (no clone needed)
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or the equivalent path on your OS:
+
+```json
+{
+  "mcpServers": {
+    "tmdb": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "git+https://github.com/ptbsare/tmdb-mcp-server.git",
+        "mcp-server-tmdb"
+      ],
+      "env": {
+        "TMDB_API_KEY": "your_tmdb_api_key_here"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop after editing the config.
+
+### Option B: local install
+
+If you prefer manual setup with a local clone, add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
